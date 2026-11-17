@@ -1,0 +1,333 @@
+
+import time
+from collections import deque
+
+import cv2
+import pandas as pd
+import streamlit as st
+from ultralytics import YOLO
+from stable_baselines3 import DQN
+
+st.set_page_config(
+    page_title="Smart Traffic Control Center",
+    page_icon="🚦",
+    layout="wide"
+)
+
+# ---------- DESIGN ----------
+st.markdown("""
+<style>
+.stApp {
+    background: #0b1120;
+    color: #e5e7eb;
+}
+[data-testid="stSidebar"] {
+    background: #111827;
+}
+h1, h2, h3 {
+    color: #f8fafc !important;
+}
+p, label {
+    color: #cbd5e1;
+}
+[data-testid="stMetric"] {
+    background: #172033;
+    border: 1px solid #29364d;
+    padding: 18px;
+    border-radius: 12px;
+}
+[data-testid="stMetricValue"] {
+    color: #38bdf8;
+}
+div[data-testid="stAlert"] {
+    border-radius: 10px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("# 🚦 SMART CITY")
+st.markdown("### Intelligent Traffic Management Control Center")
+st.caption("COMPUTER VISION  /  YOLO  /  REINFORCEMENT LEARNING")
+st.divider()
+
+# ---------- SIDEBAR ----------
+st.sidebar.title("⚙️ Control Panel")
+
+controller_type = st.sidebar.selectbox(
+    "AI controller",
+    ["TRAFFIC_AWARE", "DQN"]
+)
+
+video_path = st.sidebar.text_input(
+    "Traffic video",
+    "traffic.mp4"
+)
+
+confidence = st.sidebar.slider(
+    "Detection confidence",
+    0.05, 0.90, 0.15, 0.05
+)
+
+start = st.sidebar.button(
+    "▶ Start monitoring",
+    type="primary",
+    use_container_width=True
+)
+
+st.sidebar.caption("Press Q in the terminal to stop the server.")
+
+st.info(
+    "DEMO MODE — Signal decisions are visual recommendations. "
+    "They do not control real traffic lights."
+)
+
+# ---------- FIXED DASHBOARD LAYOUT ----------
+m1, m2, m3, m4 = st.columns(4)
+
+vehicle_metric = m1.empty()
+density_metric = m2.empty()
+left_metric = m3.empty()
+right_metric = m4.empty()
+
+st.divider()
+
+left_panel, right_panel = st.columns([1.65, 1])
+
+with left_panel:
+    st.subheader("📹 Live Computer Vision")
+    video_display = st.empty()
+
+with right_panel:
+    st.subheader("🚦 Intersection Signals")
+    signal_display = st.empty()
+
+    st.subheader("🚘 Vehicle Breakdown")
+    vehicle_table = st.empty()
+
+st.divider()
+st.subheader("📈 Traffic Analytics")
+chart_display = st.empty()
+
+status_display = st.empty()
+
+# ---------- START PROCESSING ----------
+if start:
+    cap = None
+
+    try:
+        with st.spinner("Loading AI models..."):
+            detector = YOLO("yolo26n.pt")
+            dqn = DQN.load("traffic_dqn")
+
+        cap = cv2.VideoCapture(video_path)
+
+        if not cap.isOpened():
+            st.error(f"Cannot open video: {video_path}")
+            st.stop()
+
+        vehicle_classes = {
+            2: "Cars",
+            3: "Motorcycles",
+            5: "Buses",
+            7: "Trucks"
+        }
+
+        phase = 0
+        frame_number = 0
+        history = deque(maxlen=40)
+
+        status_display.success("● MONITORING ACTIVE")
+
+        while True:
+            ok, frame = cap.read()
+
+            if not ok:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            height, width = frame.shape[:2]
+            middle = width // 2
+
+            results = detector(
+                frame,
+                conf=confidence,
+                verbose=False
+            )
+
+            counts = {
+                "Cars": 0,
+                "Motorcycles": 0,
+                "Buses": 0,
+                "Trucks": 0
+            }
+
+            left_count = 0
+            right_count = 0
+
+            for result in results:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+
+                    if class_id not in vehicle_classes:
+                        continue
+
+                    name = vehicle_classes[class_id]
+                    counts[name] += 1
+
+                    x1, y1, x2, y2 = map(
+                        int, box.xyxy[0].tolist()
+                    )
+
+                    center_x = (x1 + x2) // 2
+
+                    if center_x < middle:
+                        left_count += 1
+                    else:
+                        right_count += 1
+
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 230, 150),
+                        2
+                    )
+
+                    cv2.putText(
+                        frame,
+                        name,
+                        (x1, max(y1 - 8, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 230, 150),
+                        2
+                    )
+
+            total = sum(counts.values())
+
+            if total < 5:
+                density = "LOW"
+            elif total < 12:
+                density = "MEDIUM"
+            else:
+                density = "HIGH"
+
+            # Controller decision
+            if controller_type == "DQN":
+                observation = [
+                    min(left_count, 50) / 50,
+                    min(right_count, 50) / 50,
+                    float(phase)
+                ]
+
+                action, _ = dqn.predict(
+                    observation,
+                    deterministic=True
+                )
+                action = int(action)
+            else:
+                if left_count > right_count:
+                    action = 0
+                elif right_count > left_count:
+                    action = 1
+                else:
+                    action = phase
+
+            phase = action
+            frame_number += 1
+
+            # Fixed metric cards: update, never append
+            vehicle_metric.metric(
+                "Visible Vehicles", total
+            )
+            density_metric.metric(
+                "Traffic Density", density
+            )
+            left_metric.metric(
+                "Left Region", left_count
+            )
+            right_metric.metric(
+                "Right Region", right_count
+            )
+
+            # Signal panel updates in one fixed location
+            left_signal, right_signal = st.columns(2)
+
+            with signal_display.container():
+                s1, s2 = st.columns(2)
+
+                with s1:
+                    if phase == 0:
+                        st.success("🟢 LEFT — GREEN")
+                    else:
+                        st.error("🔴 LEFT — RED")
+
+                with s2:
+                    if phase == 1:
+                        st.success("🟢 RIGHT — GREEN")
+                    else:
+                        st.error("🔴 RIGHT — RED")
+
+                st.caption(
+                    f"Controller: {controller_type}  |  "
+                    f"Frame: {frame_number}"
+                )
+
+            vehicle_table.dataframe(
+                pd.DataFrame({
+                    "Vehicle type": list(counts.keys()),
+                    "Visible now": list(counts.values())
+                }),
+                hide_index=True,
+                use_container_width=True
+            )
+
+            # Video overlay
+            cv2.line(
+                frame,
+                (middle, 0),
+                (middle, height),
+                (255, 210, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"TRAFFIC: {density}",
+                (20, height - 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 230, 150),
+                2
+            )
+
+            frame_rgb = cv2.cvtColor(
+                frame, cv2.COLOR_BGR2RGB
+            )
+
+            video_display.image(
+                frame_rgb,
+                channels="RGB",
+                use_container_width=True
+            )
+
+            history.append({
+                "Frame": frame_number,
+                "Cars": counts["Cars"],
+                "Motorcycles": counts["Motorcycles"],
+                "Buses": counts["Buses"],
+                "Trucks": counts["Trucks"]
+            })
+
+            chart_df = pd.DataFrame(history).set_index("Frame")
+
+            chart_display.line_chart(chart_df)
+
+            time.sleep(0.5)
+
+    except Exception as error:
+        status_display.error(f"Analysis error: {error}")
+
+    finally:
+        if cap is not None:
+            cap.release()
